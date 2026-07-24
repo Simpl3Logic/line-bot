@@ -1,9 +1,16 @@
 {
+  "name": "line-bot",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.113.0",
     "@line/bot-sdk": "^11.2.0",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
-    "mysql2": "^3.23.1"
+    "mysql2": "^3.23.1",
+    "pm2": "^7.0.3"
   }
 }
