@@ -1,16 +1,18 @@
 // LINE Group Chatbot + Claude API,資料存在 MySQL(Cloudways)
-// 需要的套件: npm install express @line/bot-sdk @anthropic-ai/sdk dotenv mysql2
+// 需要的套件: npm install express @line/bot-sdk @anthropic-ai/sdk dotenv mysql2 node-cron
 
 require('dotenv').config();
 const express = require('express');
 const line = require('@line/bot-sdk');
 const Anthropic = require('@anthropic-ai/sdk');
 const mysql = require('mysql2/promise');
+const cron = require('node-cron');
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const app = express();
 
 // 資料庫連線池(沿用 WordPress 那個資料庫,表格用 linebot_ 前綴區分,不會互相干擾)
+// timezone: 'Z' 讓 DATETIME 一律當 UTC 存取,不受伺服器系統時區影響,排程提醒的時間判斷才不會跑掉
 const pool = mysql.createPool({
   host: process.env.DB_HOST,
   port: process.env.DB_PORT || 3306,
@@ -20,6 +22,7 @@ const pool = mysql.createPool({
   connectTimeout: 20000,
   waitForConnections: true,
   connectionLimit: 5,
+  timezone: 'Z',
 });
 
 // 定義人設和語氣 —— 改這裡就能調整 AI 講話的感覺
@@ -270,6 +273,43 @@ async function shouldRespond(bot, text, groupId) {
   return allKeywords.some((kw) => text.includes(kw));
 }
 
+// ---------- 排程提醒 ----------
+
+async function createReminder(botId, groupId, message, remindAt) {
+  await pool.query(
+    'INSERT INTO linebot_reminders (bot_id, group_id, message, remind_at) VALUES (?, ?, ?, ?)',
+    [botId, groupId, message, remindAt]
+  );
+}
+
+async function getPendingReminders(botId, groupId) {
+  const [rows] = await pool.query(
+    'SELECT id, message, remind_at FROM linebot_reminders WHERE bot_id = ? AND group_id = ? AND is_sent = 0 ORDER BY remind_at ASC',
+    [botId, groupId]
+  );
+  return rows;
+}
+
+async function deleteReminder(botId, groupId, id) {
+  const [result] = await pool.query(
+    'DELETE FROM linebot_reminders WHERE id = ? AND bot_id = ? AND group_id = ? AND is_sent = 0',
+    [id, botId, groupId]
+  );
+  return result.affectedRows > 0;
+}
+
+async function getDueReminders() {
+  const [rows] = await pool.query(
+    'SELECT id, bot_id, group_id, message FROM linebot_reminders WHERE is_sent = 0 AND remind_at <= ?',
+    [new Date()]
+  );
+  return rows;
+}
+
+async function markReminderSent(id) {
+  await pool.query('UPDATE linebot_reminders SET is_sent = 1 WHERE id = ?', [id]);
+}
+
 // ---------- 圖片辨識 ----------
 // 群組裡使用者常常是「先傳圖、再喊小n」分成兩則訊息,所以圖片先暫存,
 // 等真的觸發回應時才附上這張圖給 Claude 看,避免每張圖都自動回覆洗版。
@@ -300,9 +340,11 @@ async function downloadImage(bot, messageId) {
 // ---------- 指令表 ----------
 // 群組成員傳「/指令」開頭的訊息,直接由程式處理,不呼叫Claude(省token)
 
+const REMINDER_INPUT_REGEX = /^(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2})\s+(.+)$/s;
+
 const COMMANDS = {
   '/help': async () =>
-    '可用指令:\n/help - 顯示這個列表\n/reset - 清除這個群組的對話記憶\n/style 描述 - 調整這個群組的AI風格\n/style-reset - 恢復預設風格\n/nickname 新綽號 - 新增一個能叫醒我的暱稱\n/nickname-reset - 清除自訂暱稱,只留預設的',
+    '可用指令:\n/help - 顯示這個列表\n/reset - 清除這個群組的對話記憶\n/style 描述 - 調整這個群組的AI風格\n/style-reset - 恢復預設風格\n/nickname 新綽號 - 新增一個能叫醒我的暱稱\n/nickname-reset - 清除自訂暱稱,只留預設的\n/remind 日期 時間 內容 - 設定提醒(台灣時間),例如 /remind 2026-08-01 09:00 開會\n/remind-list - 查看這個群組待提醒的清單\n/remind-del 編號 - 刪除一筆提醒',
   '/reset': async (botId, groupId) => {
     await clearHistory(botId, groupId);
     return '已清除這個群組的對話記憶,重新開始聊';
@@ -324,6 +366,39 @@ const COMMANDS = {
   '/nickname-reset': async (botId, groupId) => {
     await clearNicknames(botId, groupId);
     return '已清除自訂暱稱,只留預設的觸發詞';
+  },
+  '/remind': async (botId, groupId, args) => {
+    if (!args) return '用法:/remind YYYY-MM-DD HH:mm 提醒內容(台灣時間)\n例如:/remind 2026-08-01 09:00 記得交企劃書';
+    const match = args.match(REMINDER_INPUT_REGEX);
+    if (!match) return '格式錯了,用這個格式:/remind YYYY-MM-DD HH:mm 提醒內容';
+    const [, date, time, message] = match;
+    const remindAt = new Date(`${date}T${time}:00+08:00`);
+    if (Number.isNaN(remindAt.getTime())) return '日期時間格式錯了,檢查一下';
+    if (remindAt <= new Date()) return '這個時間已經過了,設未來的時間';
+    await createReminder(botId, groupId, message, remindAt);
+    return `已記住,${date} ${time}(台灣時間)會提醒:「${message}」✅`;
+  },
+  '/remind-list': async (botId, groupId) => {
+    const reminders = await getPendingReminders(botId, groupId);
+    if (reminders.length === 0) return '目前沒有待提醒的事項';
+    const list = reminders
+      .map((r, i) => {
+        const local = r.remind_at.toLocaleString('zh-TW', {
+          timeZone: 'Asia/Taipei',
+          hour12: false,
+        });
+        return `${i + 1}. [#${r.id}] ${local}\n   ${r.message}`;
+      })
+      .join('\n\n');
+    return `待提醒清單:\n\n${list}`;
+  },
+  '/remind-del': async (botId, groupId, args) => {
+    if (!args) return '用法:/remind-del 編號\n先用 /remind-list 查編號';
+    const id = parseInt(args.trim(), 10);
+    if (Number.isNaN(id)) return '編號要是數字';
+    const deleted = await deleteReminder(botId, groupId, id);
+    if (!deleted) return '找不到這個提醒,或已經送出了';
+    return `已刪除提醒 #${id}`;
   },
 };
 
@@ -437,6 +512,35 @@ app.post('/webhook', line.middleware(legacyBot.lineConfig), async (req, res) => 
     await Promise.all(req.body.events.map((event) => handleEvent(legacyBot, event)));
   } catch (err) {
     console.error(`[${legacyBot.slug}]`, err);
+  }
+});
+
+// 每分鐘檢查一次有沒有到期的提醒,到期就用該 bot 的身份主動推播出去
+cron.schedule('* * * * *', async () => {
+  let due;
+  try {
+    due = await getDueReminders();
+  } catch (err) {
+    console.error('檢查排程提醒失敗', err);
+    return;
+  }
+
+  for (const reminder of due) {
+    const bot = BOTS.find((b) => b.slug === reminder.bot_id);
+    if (bot) {
+      try {
+        await bot.lineClient.pushMessage({
+          to: reminder.group_id,
+          messages: [{ type: 'text', text: `⏰ 提醒:${reminder.message}` }],
+        });
+      } catch (err) {
+        console.error(`[${reminder.bot_id}] 推播提醒失敗`, err);
+      }
+    } else {
+      console.warn(`[${reminder.bot_id}] 這支 bot 目前未啟用,略過提醒 #${reminder.id}`);
+    }
+    // 不管推播成不成功都標記已送出,避免失敗時一直重複嘗試同一則
+    await markReminderSent(reminder.id);
   }
 });
 
