@@ -11,7 +11,7 @@ CREATE TABLE linebot_reminders (
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   INDEX idx_pending (is_sent, remind_at),
   INDEX idx_bot_group (bot_id, group_id)
-);
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- 注意:remind_at 一律以 UTC 存取(程式碼的 mysql2 連線池設定了 timezone: 'Z'),
 -- 不依賴 MySQL 伺服器本身的時區設定,不需要另外調整資料庫的 time_zone。
