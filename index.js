@@ -310,6 +310,46 @@ async function markReminderSent(id) {
   await pool.query('UPDATE linebot_reminders SET is_sent = 1 WHERE id = ?', [id]);
 }
 
+// 使用者用 LINE 的日期時間選單選完時間後,先記住時間、等下一句話當作提醒內容,
+// 這樣就不用手打 /remind 指令的完整格式
+const PENDING_REMINDER_TIMES = new Map(); // key: `${botId}:${groupId}` -> { remindAt, expiresAt }
+const PENDING_REMINDER_TTL_MS = 5 * 60 * 1000;
+
+function rememberReminderTime(botId, groupId, remindAt) {
+  PENDING_REMINDER_TIMES.set(`${botId}:${groupId}`, {
+    remindAt,
+    expiresAt: Date.now() + PENDING_REMINDER_TTL_MS,
+  });
+}
+
+function takePendingReminderTime(botId, groupId) {
+  const key = `${botId}:${groupId}`;
+  const entry = PENDING_REMINDER_TIMES.get(key);
+  if (!entry) return null;
+  PENDING_REMINDER_TIMES.delete(key);
+  if (entry.expiresAt < Date.now()) return null;
+  return entry;
+}
+
+function formatTaipeiDatetime(date) {
+  return date.toLocaleString('zh-TW', { timeZone: 'Asia/Taipei', hour12: false });
+}
+
+// 用 LINE 原生的日期時間選單,不用手打指令格式
+function buildReminderPickerMessage() {
+  return {
+    type: 'template',
+    altText: '請選擇提醒時間',
+    template: {
+      type: 'buttons',
+      text: '要在什麼時候提醒?',
+      actions: [
+        { type: 'datetimepicker', label: '選擇時間', data: 'action=remind_datetime', mode: 'datetime' },
+      ],
+    },
+  };
+}
+
 // ---------- 群組記憶 ----------
 // 群組可以自訂 key-value,自動帶進 system prompt,不用每次都跟 bot 重講一次背景資訊
 
@@ -369,9 +409,68 @@ async function downloadImage(bot, messageId) {
 
 const REMINDER_INPUT_REGEX = /^(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2})\s+(.+)$/s;
 
+// /help 用 Flex Message 分區塊顯示,底部直接放一顆設定提醒的按鈕,不用手打指令
+function buildHelpMessage() {
+  const sectionTitle = (text) => ({
+    type: 'text',
+    text,
+    weight: 'bold',
+    size: 'sm',
+    color: '#888888',
+    margin: 'lg',
+  });
+  const commandLine = (text) => ({ type: 'text', text, size: 'sm', wrap: true, margin: 'sm' });
+
+  return {
+    type: 'flex',
+    altText: '可用指令列表',
+    contents: {
+      type: 'bubble',
+      body: {
+        type: 'box',
+        layout: 'vertical',
+        contents: [
+          { type: 'text', text: '可用指令', weight: 'bold', size: 'lg' },
+          { type: 'separator', margin: 'md' },
+          sectionTitle('對話設定'),
+          commandLine('/reset - 清除這個群組的對話記憶'),
+          commandLine('/style 描述 - 調整這個群組的AI風格'),
+          commandLine('/style-reset - 恢復預設風格'),
+          commandLine('/nickname 新綽號 - 新增一個能叫醒我的暱稱'),
+          commandLine('/nickname-reset - 清除自訂暱稱'),
+          sectionTitle('提醒'),
+          commandLine('/remind - 用選單選時間設定提醒'),
+          commandLine('/remind YYYY-MM-DD HH:mm 內容 - 直接打指令設定'),
+          commandLine('/remind-list - 查看待提醒清單'),
+          commandLine('/remind-del 編號 - 刪除一筆提醒'),
+          sectionTitle('群組記憶'),
+          commandLine('/memory-set 鍵 值 - 記住這個群組的重要資訊'),
+          commandLine('/memory-list - 查看記住的所有資訊'),
+          commandLine('/memory-del 鍵 - 刪除一筆記住的資訊'),
+        ],
+      },
+      footer: {
+        type: 'box',
+        layout: 'vertical',
+        contents: [
+          {
+            type: 'button',
+            style: 'primary',
+            action: {
+              type: 'datetimepicker',
+              label: '設定提醒',
+              data: 'action=remind_datetime',
+              mode: 'datetime',
+            },
+          },
+        ],
+      },
+    },
+  };
+}
+
 const COMMANDS = {
-  '/help': async () =>
-    '可用指令:\n/help - 顯示這個列表\n/reset - 清除這個群組的對話記憶\n/style 描述 - 調整這個群組的AI風格\n/style-reset - 恢復預設風格\n/nickname 新綽號 - 新增一個能叫醒我的暱稱\n/nickname-reset - 清除自訂暱稱,只留預設的\n/remind 日期 時間 內容 - 設定提醒(台灣時間),例如 /remind 2026-08-01 09:00 開會\n/remind-list - 查看這個群組待提醒的清單\n/remind-del 編號 - 刪除一筆提醒\n/memory-set 鍵 值 - 記住這個群組的重要資訊,例如 /memory-set 品牌調性 年輕活潑\n/memory-list - 查看這個群組記住的所有資訊\n/memory-del 鍵 - 刪除一筆記住的資訊',
+  '/help': async () => [buildHelpMessage()],
   '/reset': async (botId, groupId) => {
     await clearHistory(botId, groupId);
     return '已清除這個群組的對話記憶,重新開始聊';
@@ -395,9 +494,10 @@ const COMMANDS = {
     return '已清除自訂暱稱,只留預設的觸發詞';
   },
   '/remind': async (botId, groupId, args) => {
-    if (!args) return '用法:/remind YYYY-MM-DD HH:mm 提醒內容(台灣時間)\n例如:/remind 2026-08-01 09:00 記得交企劃書';
+    // 不加參數就直接跳出選單選時間,不用背指令格式
+    if (!args) return [buildReminderPickerMessage()];
     const match = args.match(REMINDER_INPUT_REGEX);
-    if (!match) return '格式錯了,用這個格式:/remind YYYY-MM-DD HH:mm 提醒內容';
+    if (!match) return '格式錯了,用這個格式:/remind YYYY-MM-DD HH:mm 提醒內容,或是直接打 /remind(不加任何文字)用選單選時間';
     const [, date, time, message] = match;
     const remindAt = new Date(`${date}T${time}:00+08:00`);
     if (Number.isNaN(remindAt.getTime())) return '日期時間格式錯了,檢查一下';
@@ -409,13 +509,7 @@ const COMMANDS = {
     const reminders = await getPendingReminders(botId, groupId);
     if (reminders.length === 0) return '目前沒有待提醒的事項';
     const list = reminders
-      .map((r, i) => {
-        const local = r.remind_at.toLocaleString('zh-TW', {
-          timeZone: 'Asia/Taipei',
-          hour12: false,
-        });
-        return `${i + 1}. [#${r.id}] ${local}\n   ${r.message}`;
-      })
+      .map((r, i) => `${i + 1}. [#${r.id}] ${formatTaipeiDatetime(r.remind_at)}\n   ${r.message}`)
       .join('\n\n');
     return `待提醒清單:\n\n${list}`;
   },
@@ -463,7 +557,32 @@ function parseCommand(text) {
 // LINE Console 按「Verify」時會送假事件,replyToken 是這串 0,要直接跳過不處理
 const TEST_REPLY_TOKEN = '00000000000000000000000000000000';
 
+async function handlePostback(bot, event) {
+  if (event.replyToken === TEST_REPLY_TOKEN) return null;
+  if (event.postback.data !== 'action=remind_datetime') return null;
+
+  const groupId = event.source.groupId || event.source.userId;
+  const datetime = event.postback.params && event.postback.params.datetime;
+  if (!datetime) return null;
+
+  // LINE 選單回傳的是不帶時區的當地時間字串(例如 2026-08-01T09:00),直接當台灣時間解讀
+  const remindAt = new Date(`${datetime}:00+08:00`);
+  if (Number.isNaN(remindAt.getTime()) || remindAt <= new Date()) {
+    return bot.lineClient.replyMessage({
+      replyToken: event.replyToken,
+      messages: [{ type: 'text', text: '這個時間不能用(可能已經過去了),重新打 /remind 選一次' }],
+    });
+  }
+
+  rememberReminderTime(bot.slug, groupId, remindAt);
+  return bot.lineClient.replyMessage({
+    replyToken: event.replyToken,
+    messages: [{ type: 'text', text: `好,${formatTaipeiDatetime(remindAt)} 要提醒什麼?打字告訴我內容` }],
+  });
+}
+
 async function handleEvent(bot, event) {
+  if (event.type === 'postback') return handlePostback(bot, event);
   if (event.type !== 'message') return null;
   if (!['text', 'image'].includes(event.message.type)) return null;
   if (event.replyToken === TEST_REPLY_TOKEN) return null;
@@ -493,10 +612,20 @@ async function handleEvent(bot, event) {
   // 先檢查是不是指令(/開頭),是的話直接處理,不呼叫Claude API
   const parsedCommand = parseCommand(userText);
   if (parsedCommand) {
-    const replyText = await parsedCommand.handler(bot.slug, groupId, parsedCommand.args);
+    const replyResult = await parsedCommand.handler(bot.slug, groupId, parsedCommand.args);
+    const messages = Array.isArray(replyResult) ? replyResult : [{ type: 'text', text: replyResult }];
+    return bot.lineClient.replyMessage({ replyToken: event.replyToken, messages });
+  }
+
+  // 剛剛用選單選好提醒時間、還在等提醒內容的話,這句話就直接當作提醒內容,不用喊觸發詞
+  const pendingReminder = takePendingReminderTime(bot.slug, groupId);
+  if (pendingReminder) {
+    await createReminder(bot.slug, groupId, userText, pendingReminder.remindAt);
     return bot.lineClient.replyMessage({
       replyToken: event.replyToken,
-      messages: [{ type: 'text', text: replyText }],
+      messages: [
+        { type: 'text', text: `已記住,${formatTaipeiDatetime(pendingReminder.remindAt)}(台灣時間)會提醒:「${userText}」✅` },
+      ],
     });
   }
 
