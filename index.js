@@ -310,6 +310,33 @@ async function markReminderSent(id) {
   await pool.query('UPDATE linebot_reminders SET is_sent = 1 WHERE id = ?', [id]);
 }
 
+// ---------- 群組記憶 ----------
+// 群組可以自訂 key-value,自動帶進 system prompt,不用每次都跟 bot 重講一次背景資訊
+
+async function setMemory(botId, groupId, key, value) {
+  await pool.query(
+    `INSERT INTO linebot_group_memory (bot_id, group_id, memory_key, memory_value) VALUES (?, ?, ?, ?)
+     ON DUPLICATE KEY UPDATE memory_value = VALUES(memory_value)`,
+    [botId, groupId, key, value]
+  );
+}
+
+async function getAllMemory(botId, groupId) {
+  const [rows] = await pool.query(
+    'SELECT memory_key, memory_value FROM linebot_group_memory WHERE bot_id = ? AND group_id = ? ORDER BY memory_key ASC',
+    [botId, groupId]
+  );
+  return rows;
+}
+
+async function deleteMemory(botId, groupId, key) {
+  const [result] = await pool.query(
+    'DELETE FROM linebot_group_memory WHERE bot_id = ? AND group_id = ? AND memory_key = ?',
+    [botId, groupId, key]
+  );
+  return result.affectedRows > 0;
+}
+
 // ---------- 圖片辨識 ----------
 // 群組裡使用者常常是「先傳圖、再喊小n」分成兩則訊息,所以圖片先暫存,
 // 等真的觸發回應時才附上這張圖給 Claude 看,避免每張圖都自動回覆洗版。
@@ -344,7 +371,7 @@ const REMINDER_INPUT_REGEX = /^(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2})\s+(.+)$/s;
 
 const COMMANDS = {
   '/help': async () =>
-    '可用指令:\n/help - 顯示這個列表\n/reset - 清除這個群組的對話記憶\n/style 描述 - 調整這個群組的AI風格\n/style-reset - 恢復預設風格\n/nickname 新綽號 - 新增一個能叫醒我的暱稱\n/nickname-reset - 清除自訂暱稱,只留預設的\n/remind 日期 時間 內容 - 設定提醒(台灣時間),例如 /remind 2026-08-01 09:00 開會\n/remind-list - 查看這個群組待提醒的清單\n/remind-del 編號 - 刪除一筆提醒',
+    '可用指令:\n/help - 顯示這個列表\n/reset - 清除這個群組的對話記憶\n/style 描述 - 調整這個群組的AI風格\n/style-reset - 恢復預設風格\n/nickname 新綽號 - 新增一個能叫醒我的暱稱\n/nickname-reset - 清除自訂暱稱,只留預設的\n/remind 日期 時間 內容 - 設定提醒(台灣時間),例如 /remind 2026-08-01 09:00 開會\n/remind-list - 查看這個群組待提醒的清單\n/remind-del 編號 - 刪除一筆提醒\n/memory-set 鍵 值 - 記住這個群組的重要資訊,例如 /memory-set 品牌調性 年輕活潑\n/memory-list - 查看這個群組記住的所有資訊\n/memory-del 鍵 - 刪除一筆記住的資訊',
   '/reset': async (botId, groupId) => {
     await clearHistory(botId, groupId);
     return '已清除這個群組的對話記憶,重新開始聊';
@@ -399,6 +426,29 @@ const COMMANDS = {
     const deleted = await deleteReminder(botId, groupId, id);
     if (!deleted) return '找不到這個提醒,或已經送出了';
     return `已刪除提醒 #${id}`;
+  },
+  '/memory-set': async (botId, groupId, args) => {
+    if (!args) return '用法:/memory-set 鍵 值\n例如:/memory-set 品牌調性 年輕、街頭、不正經';
+    const spaceIndex = args.indexOf(' ');
+    if (spaceIndex === -1) return '格式錯了,鍵跟值中間要有空格\n例如:/memory-set 品牌調性 年輕、街頭、不正經';
+    const key = args.slice(0, spaceIndex).trim();
+    const value = args.slice(spaceIndex + 1).trim();
+    if (!key || !value) return '鍵或值不能是空的';
+    await setMemory(botId, groupId, key, value);
+    return `已記住:${key} = ${value} ✅`;
+  },
+  '/memory-list': async (botId, groupId) => {
+    const memory = await getAllMemory(botId, groupId);
+    if (memory.length === 0) return '這個群組還沒有存任何記憶';
+    const list = memory.map((m, i) => `${i + 1}. ${m.memory_key}:${m.memory_value}`).join('\n');
+    return `群組記憶清單:\n${list}`;
+  },
+  '/memory-del': async (botId, groupId, args) => {
+    if (!args) return '用法:/memory-del 鍵\n先用 /memory-list 查有哪些';
+    const key = args.trim();
+    const deleted = await deleteMemory(botId, groupId, key);
+    if (!deleted) return `找不到「${key}」這個記憶`;
+    return `已刪除記憶:${key}`;
   },
 };
 
@@ -471,7 +521,7 @@ async function respondToMessage(bot, event, groupId, userText, image) {
     ];
   }
 
-  // 附加這個群組的自訂風格與暱稱
+  // 附加這個群組的自訂風格、暱稱、群組記憶
   const { style, nicknames } = await getGroupSettings(bot.slug, groupId);
   let systemPrompt = bot.systemPrompt;
   if (nicknames.length > 0) {
@@ -479,6 +529,12 @@ async function respondToMessage(bot, event, groupId, userText, image) {
   }
   if (style) {
     systemPrompt += `\n\n這個群組額外指定的風格調整(優先套用):\n${style}`;
+  }
+
+  const memory = await getAllMemory(bot.slug, groupId);
+  if (memory.length > 0) {
+    const memoryText = memory.map((m) => `- ${m.memory_key}:${m.memory_value}`).join('\n');
+    systemPrompt += `\n\n這個群組設定的重要資訊(回答時列入考量):\n${memoryText}`;
   }
 
   const replyText = await askClaude(systemPrompt, history);
