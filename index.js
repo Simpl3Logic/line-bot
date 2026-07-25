@@ -176,6 +176,9 @@ const BOTS = [
     lineClient: new line.messagingApi.MessagingApiClient({
       channelAccessToken: bot.channelAccessToken,
     }),
+    blobClient: new line.messagingApi.MessagingApiBlobClient({
+      channelAccessToken: bot.channelAccessToken,
+    }),
   }));
 
 const MAX_HISTORY = 10;
@@ -267,6 +270,33 @@ async function shouldRespond(bot, text, groupId) {
   return allKeywords.some((kw) => text.includes(kw));
 }
 
+// ---------- 圖片辨識 ----------
+// 群組裡使用者常常是「先傳圖、再喊小n」分成兩則訊息,所以圖片先暫存,
+// 等真的觸發回應時才附上這張圖給 Claude 看,避免每張圖都自動回覆洗版。
+
+const PENDING_IMAGES = new Map(); // key: `${botId}:${groupId}` -> { base64, mediaType, expiresAt }
+const PENDING_IMAGE_TTL_MS = 10 * 60 * 1000;
+
+function rememberImage(botId, groupId, image) {
+  PENDING_IMAGES.set(`${botId}:${groupId}`, { ...image, expiresAt: Date.now() + PENDING_IMAGE_TTL_MS });
+}
+
+function takePendingImage(botId, groupId) {
+  const key = `${botId}:${groupId}`;
+  const entry = PENDING_IMAGES.get(key);
+  if (!entry) return null;
+  PENDING_IMAGES.delete(key);
+  if (entry.expiresAt < Date.now()) return null;
+  return entry;
+}
+
+async function downloadImage(bot, messageId) {
+  const stream = await bot.blobClient.getMessageContent(messageId);
+  const chunks = [];
+  for await (const chunk of stream) chunks.push(chunk);
+  return { base64: Buffer.concat(chunks).toString('base64'), mediaType: 'image/jpeg' };
+}
+
 // ---------- 指令表 ----------
 // 群組成員傳「/指令」開頭的訊息,直接由程式處理,不呼叫Claude(省token)
 
@@ -309,11 +339,31 @@ function parseCommand(text) {
 const TEST_REPLY_TOKEN = '00000000000000000000000000000000';
 
 async function handleEvent(bot, event) {
-  if (event.type !== 'message' || event.message.type !== 'text') return null;
+  if (event.type !== 'message') return null;
+  if (!['text', 'image'].includes(event.message.type)) return null;
   if (event.replyToken === TEST_REPLY_TOKEN) return null;
 
-  const userText = event.message.text;
   const groupId = event.source.groupId || event.source.userId;
+  const isGroup = !!event.source.groupId;
+
+  if (event.message.type === 'image') {
+    let image;
+    try {
+      image = await downloadImage(bot, event.message.id);
+    } catch (err) {
+      console.error(`[${bot.slug}] 下載圖片失敗`, err);
+      return null;
+    }
+
+    // 群組裡先記住這張圖,等使用者接著喊觸發詞才一起處理;1對1直接處理
+    if (isGroup) {
+      rememberImage(bot.slug, groupId, image);
+      return null;
+    }
+    return respondToMessage(bot, event, groupId, '', image);
+  }
+
+  const userText = event.message.text;
 
   // 先檢查是不是指令(/開頭),是的話直接處理,不呼叫Claude API
   const parsedCommand = parseCommand(userText);
@@ -326,11 +376,25 @@ async function handleEvent(bot, event) {
   }
 
   // 群組中只在提到關鍵字或自訂暱稱時才回應;1對1聊天則一律回應
-  const isGroup = !!event.source.groupId;
   if (isGroup && !(await shouldRespond(bot, userText, groupId))) return null;
 
-  await appendHistory(bot.slug, groupId, 'user', userText);
+  const pendingImage = takePendingImage(bot.slug, groupId);
+  return respondToMessage(bot, event, groupId, userText, pendingImage);
+}
+
+async function respondToMessage(bot, event, groupId, userText, image) {
+  const historyText = userText || (image ? '[傳送一張圖片]' : '');
+  await appendHistory(bot.slug, groupId, 'user', historyText);
   const history = await getHistory(bot.slug, groupId);
+
+  // 圖片不存進資料庫(避免歷史記錄爆量),只在這一輪的 Claude 呼叫裡讓它看到
+  if (image) {
+    const lastMessage = history[history.length - 1];
+    lastMessage.content = [
+      { type: 'image', source: { type: 'base64', media_type: image.mediaType, data: image.base64 } },
+      { type: 'text', text: userText || '這張圖片是什麼?' },
+    ];
+  }
 
   // 附加這個群組的自訂風格與暱稱
   const { style, nicknames } = await getGroupSettings(bot.slug, groupId);
