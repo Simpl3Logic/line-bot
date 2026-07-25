@@ -159,16 +159,24 @@ const BOTS = [
     triggerKeywords: ['嘻哈仔', '@嘻哈仔', 'HipHop仔', '@HipHop仔'],
     systemPrompt: SYSTEM_PROMPT_HIPHOP_ZAI,
   },
-].map((bot) => ({
-  ...bot,
-  lineConfig: {
-    channelAccessToken: bot.channelAccessToken,
-    channelSecret: bot.channelSecret,
-  },
-  lineClient: new line.messagingApi.MessagingApiClient({
-    channelAccessToken: bot.channelAccessToken,
-  }),
-}));
+]
+  .filter((bot) => {
+    const ready = Boolean(bot.channelAccessToken && bot.channelSecret);
+    if (!ready) {
+      console.warn(`[${bot.slug}] 缺少 LINE channel 憑證,先跳過這支 bot,不註冊它的 webhook`);
+    }
+    return ready;
+  })
+  .map((bot) => ({
+    ...bot,
+    lineConfig: {
+      channelAccessToken: bot.channelAccessToken,
+      channelSecret: bot.channelSecret,
+    },
+    lineClient: new line.messagingApi.MessagingApiClient({
+      channelAccessToken: bot.channelAccessToken,
+    }),
+  }));
 
 const MAX_HISTORY = 10;
 
