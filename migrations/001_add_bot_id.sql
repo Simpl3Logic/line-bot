@@ -17,12 +17,14 @@ ALTER TABLE linebot_group_settings
 --    (程式碼用 INSERT ... ON DUPLICATE KEY UPDATE,依賴這個唯一鍵才能運作)
 SHOW CREATE TABLE linebot_group_settings;
 
--- 4. 把上一步看到的舊唯一鍵名稱代入下面的 DROP INDEX,
---    並把 group_id 的唯一鍵改成 (bot_id, group_id) 複合唯一鍵。
---    常見鍵名可能是 group_id 或 PRIMARY,依實際 SHOW CREATE TABLE 結果調整,例如:
--- ALTER TABLE linebot_group_settings DROP INDEX group_id;
+-- 4. 把 group_id 的唯一鍵改成 (bot_id, group_id) 複合唯一鍵。
+--    實際環境測過,這張表原本是 PRIMARY KEY (group_id),不是叫 group_id 的一般索引,
+--    所以是用 DROP PRIMARY KEY,不是 DROP INDEX group_id。
+--    如果你的環境原本的鍵不是 PRIMARY KEY 而是一般 UNIQUE INDEX,把下面第一行換成
+--    ALTER TABLE linebot_group_settings DROP INDEX <你查到的鍵名>;
 ALTER TABLE linebot_group_settings
-  ADD UNIQUE KEY uniq_bot_group (bot_id, group_id);
+  DROP PRIMARY KEY,
+  ADD PRIMARY KEY (bot_id, group_id);
 
 -- 完成後,新資料會依 (bot_id, group_id) 隔離;
 -- 之後新增第三支 bot 時,只要在 index.js 的 BOTS 陣列多加一筆設定即可,不用再改資料庫結構。
