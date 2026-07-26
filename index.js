@@ -44,7 +44,9 @@ const SYSTEM_PROMPT_XIAO_N = `你是 G4G 品牌LINE群組的一員,名字叫小n
 
 簡單問題就簡短回,需要深入分析時再展開講。
 
-你有一個網路搜尋工具可以用。只有在遇到需要最新資訊的問題時才呼叫它,例如時事、天氣、股價、比賽結果,或任何你不確定、可能過時的內容;平常閒聊不要每句都搜尋。搜尋回來的結果要消化過再用你的語氣自然講出來,不要整段貼網址或原始搜尋資料。`;
+你有一個網路搜尋工具可以用。只有在遇到需要最新資訊的問題時才呼叫它,例如時事、天氣、股價、比賽結果,或任何你不確定、可能過時的內容;平常閒聊不要每句都搜尋。搜尋回來的結果要消化過再用你的語氣自然講出來,不要整段貼網址或原始搜尋資料。
+
+群組對話紀錄裡,如果訊息前面有「名字:」,代表是那個人講的,你可以據此分辨群組裡不同的人是誰講了什麼,回覆時可以視情況叫名字或提及是誰講的,但不用每句都刻意提到名字,自然就好。`;
 
 const SYSTEM_PROMPT_HIPHOP_ZAI = `你是 G4G 品牌LINE群組的一員,名字叫嘻哈仔,不是客服也不是助理,而是這個品牌閒聊/企劃群組裡的饒舌魂,滿腦子 hiphop 文化、街頭潮流、球鞋和節奏感,講話帶點饒舌的押韻和氣勢,但不是為了尬饒舌而尬饒舌。
 
@@ -64,7 +66,9 @@ const SYSTEM_PROMPT_HIPHOP_ZAI = `你是 G4G 品牌LINE群組的一員,名字叫
 
 簡單問題就簡短回,需要深入分析時再展開講。
 
-你有一個網路搜尋工具可以用。只有在遇到需要最新資訊的問題時才呼叫它,例如時事、天氣、股價、比賽結果,或任何你不確定、可能過時的內容;平常閒聊不要每句都搜尋。搜尋回來的結果要消化過再用你的語氣自然講出來,不要整段貼網址或原始搜尋資料。`;
+你有一個網路搜尋工具可以用。只有在遇到需要最新資訊的問題時才呼叫它,例如時事、天氣、股價、比賽結果,或任何你不確定、可能過時的內容;平常閒聊不要每句都搜尋。搜尋回來的結果要消化過再用你的語氣自然講出來,不要整段貼網址或原始搜尋資料。
+
+群組對話紀錄裡,如果訊息前面有「名字:」,代表是那個人講的,你可以據此分辨群組裡不同的人是誰講了什麼,回覆時可以視情況叫名字或提及是誰講的,但不用每句都刻意提到名字,自然就好。`;
 
 // ---------- 網路搜尋工具(Tavily) ----------
 // 用 Claude 原生 tool-use 串,不引入 LangChain,改動範圍最小
@@ -377,6 +381,32 @@ async function deleteMemory(botId, groupId, key) {
   return result.affectedRows > 0;
 }
 
+// ---------- 群組成員名稱 ----------
+// 群組對話預設分不出來是誰講的話,抓一下顯示名稱標在訊息前面,讓 Claude 看得出來是誰
+// 名稱快取一小時,避免每則訊息都打一次 LINE API
+
+const GROUP_MEMBER_NAME_CACHE = new Map(); // key: `${botId}:${groupId}:${userId}` -> { name, expiresAt }
+const GROUP_MEMBER_NAME_TTL_MS = 60 * 60 * 1000;
+
+async function getGroupMemberName(bot, groupId, userId) {
+  if (!userId) return null;
+  const key = `${bot.slug}:${groupId}:${userId}`;
+  const cached = GROUP_MEMBER_NAME_CACHE.get(key);
+  if (cached && cached.expiresAt > Date.now()) return cached.name;
+
+  try {
+    const profile = await bot.lineClient.getGroupMemberProfile(groupId, userId);
+    GROUP_MEMBER_NAME_CACHE.set(key, {
+      name: profile.displayName,
+      expiresAt: Date.now() + GROUP_MEMBER_NAME_TTL_MS,
+    });
+    return profile.displayName;
+  } catch (err) {
+    // 對方可能沒加過 bot 好友、或隱私設定拿不到,抓不到就算了,不影響其他功能
+    return null;
+  }
+}
+
 // ---------- 圖片辨識 ----------
 // 群組裡使用者常常是「先傳圖、再喊小n」分成兩則訊息,所以圖片先暫存,
 // 等真的觸發回應時才附上這張圖給 Claude 看,避免每張圖都自動回覆洗版。
@@ -637,8 +667,14 @@ async function handleEvent(bot, event) {
 }
 
 async function respondToMessage(bot, event, groupId, userText, image) {
-  const historyText = userText || (image ? '[傳送一張圖片]' : '');
-  await appendHistory(bot.slug, groupId, 'user', historyText);
+  const isGroup = !!event.source.groupId;
+  // 群組裡抓一下顯示名稱標在訊息前面,讓 Claude 分得出來是誰講的;1對1不用標
+  const senderName = isGroup ? await getGroupMemberName(bot, groupId, event.source.userId) : null;
+
+  const baseText = userText || (image ? '這張圖片是什麼?' : '');
+  const storedText = senderName ? `${senderName}:${baseText}` : baseText;
+
+  await appendHistory(bot.slug, groupId, 'user', storedText);
   const history = await getHistory(bot.slug, groupId);
 
   // 圖片不存進資料庫(避免歷史記錄爆量),只在這一輪的 Claude 呼叫裡讓它看到
@@ -646,7 +682,7 @@ async function respondToMessage(bot, event, groupId, userText, image) {
     const lastMessage = history[history.length - 1];
     lastMessage.content = [
       { type: 'image', source: { type: 'base64', media_type: image.mediaType, data: image.base64 } },
-      { type: 'text', text: userText || '這張圖片是什麼?' },
+      { type: 'text', text: storedText },
     ];
   }
 
