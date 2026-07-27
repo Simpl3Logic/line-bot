@@ -689,6 +689,17 @@ async function respondToMessage(bot, event, groupId, userText, image) {
   // 附加這個群組的自訂風格、暱稱、群組記憶
   const { style, nicknames } = await getGroupSettings(bot.slug, groupId);
   let systemPrompt = bot.systemPrompt;
+
+  // Claude 沒有時鐘,不主動告訴它今天日期的話會用訓練資料亂猜,所以每次都帶入真實日期
+  const todayTaipei = new Date().toLocaleDateString('zh-TW', {
+    timeZone: 'Asia/Taipei',
+    year: 'numeric',
+    month: 'long',
+    day: 'numeric',
+    weekday: 'long',
+  });
+  systemPrompt += `\n\n今天的日期是:${todayTaipei}(台灣時間)。`;
+
   if (nicknames.length > 0) {
     systemPrompt += `\n\n這個群組額外幫你取的暱稱:${nicknames.join('、')},被這樣稱呼也要有反應。`;
   }
