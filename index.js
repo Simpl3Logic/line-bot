@@ -129,7 +129,7 @@ async function askClaude(systemPrompt, initialMessages) {
   for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
     const response = await anthropic.messages.create({
       model: 'claude-sonnet-4-6',
-      max_tokens: 500,
+      max_tokens: 1500,
       system: systemPrompt,
       messages,
       tools: [WEB_SEARCH_TOOL],
@@ -162,6 +162,19 @@ async function askClaude(systemPrompt, initialMessages) {
   }
 
   return '（查太多輪資料還沒整理完,先這樣回你,晚點再問我一次)';
+}
+
+// LINE 文字訊息單則上限是 5000 字,超過的話拆成多則(一次最多回 5 則)
+const LINE_TEXT_MAX_LENGTH = 4500;
+
+function textMessages(text) {
+  const chunks = [];
+  let remaining = text;
+  while (remaining.length > 0 && chunks.length < 5) {
+    chunks.push({ type: 'text', text: remaining.slice(0, LINE_TEXT_MAX_LENGTH) });
+    remaining = remaining.slice(LINE_TEXT_MAX_LENGTH);
+  }
+  return chunks;
 }
 
 // ---------- 多 bot 設定 ----------
@@ -616,14 +629,14 @@ async function handlePostback(bot, event) {
   if (Number.isNaN(remindAt.getTime()) || remindAt <= new Date()) {
     return bot.lineClient.replyMessage({
       replyToken: event.replyToken,
-      messages: [{ type: 'text', text: '這個時間不能用(可能已經過去了),重新打 /remind 選一次' }],
+      messages: textMessages('這個時間不能用(可能已經過去了),重新打 /remind 選一次'),
     });
   }
 
   rememberReminderTime(bot.slug, groupId, remindAt);
   return bot.lineClient.replyMessage({
     replyToken: event.replyToken,
-    messages: [{ type: 'text', text: `好,${formatTaipeiDatetime(remindAt)} 要提醒什麼?打字告訴我內容` }],
+    messages: textMessages(`好,${formatTaipeiDatetime(remindAt)} 要提醒什麼?打字告訴我內容`),
   });
 }
 
@@ -659,7 +672,7 @@ async function handleEvent(bot, event) {
   const parsedCommand = parseCommand(userText);
   if (parsedCommand) {
     const replyResult = await parsedCommand.handler(bot.slug, groupId, parsedCommand.args);
-    const messages = Array.isArray(replyResult) ? replyResult : [{ type: 'text', text: replyResult }];
+    const messages = Array.isArray(replyResult) ? replyResult : textMessages(replyResult);
     return bot.lineClient.replyMessage({ replyToken: event.replyToken, messages });
   }
 
@@ -669,9 +682,9 @@ async function handleEvent(bot, event) {
     await createReminder(bot.slug, groupId, userText, pendingReminder.remindAt);
     return bot.lineClient.replyMessage({
       replyToken: event.replyToken,
-      messages: [
-        { type: 'text', text: `已記住,${formatTaipeiDatetime(pendingReminder.remindAt)}(台灣時間)會提醒:「${userText}」✅` },
-      ],
+      messages: textMessages(
+        `已記住,${formatTaipeiDatetime(pendingReminder.remindAt)}(台灣時間)會提醒:「${userText}」✅`
+      ),
     });
   }
 
@@ -735,7 +748,7 @@ async function respondToMessage(bot, event, groupId, userText, image) {
 
   return bot.lineClient.replyMessage({
     replyToken: event.replyToken,
-    messages: [{ type: 'text', text: replyText }],
+    messages: textMessages(replyText),
   });
 }
 
@@ -779,7 +792,7 @@ cron.schedule('* * * * *', async () => {
       try {
         await bot.lineClient.pushMessage({
           to: reminder.group_id,
-          messages: [{ type: 'text', text: `⏰ 提醒:${reminder.message}` }],
+          messages: textMessages(`⏰ 提醒:${reminder.message}`),
         });
       } catch (err) {
         console.error(`[${reminder.bot_id}] 推播提醒失敗`, err);
